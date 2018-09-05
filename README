@@ -1,0 +1,3 @@
+This repo is a pipeline that runs PIQ. It uses the python v3 CGATCore framework
+It assumes the existance of a conda environment called alexia
+
