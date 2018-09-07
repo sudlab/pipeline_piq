@@ -125,7 +125,7 @@ def process_bam(infile, outfile):
          formatter(),
          process_pwms,
          formatter("motif.matchs/(?P<PWM>.+).pwmout.RData"),
-         "calls.dir/{basename[0][0]}/{PWM[1][0]}.calls.tsv")
+         "calls.dir/{basename[0][0]}/{PWM[1][0]}.done")
 def call_matches(infiles, outfile):
 
     bamfile, pwm = infiles
@@ -133,7 +133,7 @@ def call_matches(infiles, outfile):
     bamfile = os.path.abspath(bamfile)
     matchesdir = os.path.abspath(os.path.dirname(pwm))
     pwm_no = P.snip(os.path.basename(pwm), ".pwmout.RData")
-    
+    outfile = os.path.abspath(outfile)  
     pertf_script = os.path.join(PARAMS["PIQ_PATH"], "pertf.r")
     outdir = os.path.dirname(os.path.abspath(outfile))
     statement = '''cd %(PIQ_PATH)s &&
@@ -144,7 +144,8 @@ def call_matches(infiles, outfile):
                             %(outdir)s 
                             %(bamfile)s
                             %(pwm_no)s &&
-                  rm -rf $TMPDIR/*'''
+                  rm -rf $TMPDIR/* &&
+                  touch %(outfile)s'''
 
     # Memory usage depends on input size
 
@@ -156,8 +157,12 @@ def call_matches(infiles, outfile):
 
     if bamsize > 700:
         size += 15
-        
-    if size > 30:
+
+    if size > 60:
+        job_memory = "128G"
+    elif size > 45:
+        job_memory = "64G"    
+    elif size > 30:
         job_memory = "32G"
     elif size > 15:
         job_memory = "16G"
