@@ -67,8 +67,13 @@ Code
 """
 import sys
 import os
-from ruffus import transform, regex, suffix, follows, mkdir, split, formatter
+import CGATCore.IOTools as IOTools
+import glob
+import tempfile
+import pipelinePIQ
+from ruffus import transform, regex, suffix, follows, mkdir, split, formatter, collate
 from ruffus.combinatorics import product
+
 
 from CGATCore import Pipeline as P
 
@@ -81,11 +86,50 @@ PARAMS = P.get_parameters(
 PARAMS["COMMONSCRIPT"] = os.path.join(PARAMS["PIQ_PATH"], "common.r")
 
 
+# Based on Copied from Motif_tools.motif_db_formatting_py3
+# 
+# Inputs:
+#     -infile: A jaspar motif format file. Such as:
+#        /shared/sudlab1/General/apps/bio/PIQ_human/pwms/jasparfix.txt
+#
+# >MA0001.1;AGL3
+# A  [ 0  3 79 40 66 48 65 11 65  0 ]
+# C  [94 75  4  3  1  2  5  2  3  3 ]
+# G  [ 1  0  3  4  1  0  5  3 28 88 ]
+# T  [ 2 19 11 50 29 47 22 81  1  6 ]
+# >MA0002.1;RUNX1
+# A  [10 12  4  1  2  2  0  0  0  8 13 ]
+# C  [ 2  2  7  1  0  8  0  0  1  2  2 ]
+# G  [ 3  1  1  0 23  0 26 26  0  0  4 ]
+# T  [11 11 14 24  1 16  0  0 25 16  7 ]
+#
+# -number of motifs: Counts the number of lines beginning with ">"
+#
+# Outputs:
+#     The number of motifs
+def countMotifs(infile):
+    
+    num_motifs = 0
+    
+    with IOTools.open_file(infile, "r") as reader:
+        
+        for line in reader:
+
+            # New motif
+            if line.startswith(">"):
+                
+                num_motifs += 1
+                
+        return num_motifs
+                
+    reader.close()
+
+
 # ---------------------------------------------------
 # Specific pipeline tasks
 @follows(mkdir("motif.matchs"))
 @split(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"),
-       ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(1320)])
+       ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt")))])
 def process_pwms(infile, outfiles):
 
     statements = []
@@ -96,7 +140,10 @@ def process_pwms(infile, outfiles):
     
     statement_template = "Rscript %%(match_script)s %%(COMMONSCRIPT)s %%(infile)s %(i)i %%(out_dir)s"
     
-    for i in range(1,1321,1):
+    # Get the number of motifs in the file
+    num_motifs_file = countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"))
+    
+    for i in range(1,(num_motifs_file+1),1):
         statement.append(statement_template % locals())
         if len(statement) == PARAMS["chunk_size"]:
             statements.append("cd %(PIQ_PATH)s && "+ " && ".join(statement))
@@ -172,11 +219,117 @@ def call_matches(infiles, outfile):
         job_memory = "4G"
 
     P.run(statement, job_condaenv = PARAMS["piq_condaenv"])
+    
+    
+
+
+@follows(call_matches,
+         mkdir("calls_filtered.dir"))
+@collate("calls.dir/*/*-calls.*",
+           formatter("calls.dir/(?P<SAMPLE>.+)/(?P<PWM>.+?)(\.RC|)-calls\..*"),
+           "calls_filtered.dir/{SAMPLE[0]}/{PWM[0]}-calls.sign.bed.gz",
+           "{SAMPLE[0]}",
+           "{PWM[0]}")
+def filter_matches(infiles, outfile, sample, pwm):
+    
+   
+    if(len(infiles) != 6):
+        raise Exception("All the call files are not produced")
+    
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+    
+    # Get the different files
+    calls_all_file=""
+    RC_calls_all_file=""
+    calls_sign_file=""
+    RC_calls_sign_file=""
+    
+    for infile in infiles:
+        if infile.endswith("-calls.all.bed"):
+            if infile.endswith(".RC-calls.all.bed"):
+                RC_calls_all_file=infile
+            else:
+                calls_all_file=infile
+        
+        elif infile.endswith("-calls.csv"):
+            if infile.endswith(".RC-calls.csv"):
+                RC_calls_sign_file=infile
+            else:
+                calls_sign_file=infile
+    
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+    
+    # Temp file: We create a temp file to make sure the whole process goes well
+    # before the actual outfile is created
+    
+    # Processing of the files containing all calls
+    temp_file_all_calls = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    temp_file_all_calls_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Processing of the
+    temp_file_calls_sign = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    temp_file_calls_sign_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    
+            
+    # The first step is to remove the header from both files and filter individually the
+    # significant motifs
+    # Output the rest of the file adding a numeric count starting at 1
+    statement = '''cat %(calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls)s  &&
+        
+    cat %(RC_calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls_RC)s  &&
+    
+    cat %(calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign)s  &&
+        
+    cat %(RC_calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign_RC)s '''
+    
+    P.run(statement)
+    
+    
+    # Processing of the bed files to select significant calls
+    temp_file_calls_sign_bed = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    temp_file_calls_sign_bed_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    # Now merge the tables to select only significant calls in bed format
+    pipelinePIQ.filterSignCalls(temp_file_all_calls,
+                    temp_file_calls_sign,
+                    temp_file_calls_sign_bed)
+    
+    pipelinePIQ.filterSignCalls(temp_file_all_calls_RC,
+                    temp_file_calls_sign_RC,
+                    temp_file_calls_sign_bed_RC)
+    
+    
+    # Create temp output
+    temp_output = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    
+    
+    # Now concatenate both bed files and sort by chr and start
+    # Delete all temporal files 
+
+    statement = '''zcat %(temp_file_calls_sign_bed)s %(temp_file_calls_sign_bed_RC)s | sort -k 1,1 -k2,2n | gzip > %(temp_output)s && 
+    rm %(temp_file_all_calls)s %(temp_file_all_calls_RC)s %(temp_file_calls_sign)s %(temp_file_calls_sign_RC)s %(temp_file_calls_sign_bed)s %(temp_file_calls_sign_bed_RC)s && 
+    mv %(temp_output)s %(outfile)s '''
+    
+    P.run(statement)
+    
+
+   
+       
+
 
 
 # ---------------------------------------------------
 # Generic pipeline tasks
-@follows(call_matches)
+@follows(filter_matches)
 def full():
     pass
 
