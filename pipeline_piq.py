@@ -131,6 +131,12 @@ def countMotifs(infile):
 @split(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"),
        ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt")))])
 def process_pwms(infile, outfiles):
+    
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+    
+    # Create a temporary dir
+    output_temp_dir = tempfile.mkdtemp(dir=tmp_dir)
 
     statements = []
     statement = []
@@ -138,30 +144,54 @@ def process_pwms(infile, outfiles):
     out_dir = os.path.dirname(os.path.abspath(outfiles[0]))
     job_memory = "8G"
     
-    statement_template = "Rscript %%(match_script)s %%(COMMONSCRIPT)s %%(infile)s %(i)i %%(out_dir)s"
+    statement_template = "Rscript %%(match_script)s %%(COMMONSCRIPT)s %%(infile)s %(i)i %%(output_temp_dir)s && mv %%(output_temp_dir)s/* %%(out_dir)s/"
     
     # Get the number of motifs in the file
     num_motifs_file = countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"))
     
     for i in range(1,(num_motifs_file+1),1):
-        statement.append(statement_template % locals())
+        
+        # Everytime we begin a new chunk of statements we append cd PIQ_PATH
+        if((i-1)%PARAMS["chunk_size"] == 0):
+            statement.append("cd %(PIQ_PATH)s && " + (statement_template % locals()))
+        else:
+            statement.append(statement_template % locals())
+        
+        # After we add the individual statement we concatenate statements in chunks of selected size     
         if len(statement) == PARAMS["chunk_size"]:
-            statements.append("cd %(PIQ_PATH)s && "+ " && ".join(statement))
+            statements.append(" && ".join(statement))
             statement = []
-
-    statements.append( "&&".join(statement))
+    
+    # Append the remaining statements
+    
+    # Remove the temporal directory
+    statement.append("rm -rf %(output_temp_dir)s")
+    
+    statements.append(" && ".join(statement))
+    
+    
+    
     
     P.run(statements, job_condaenv=PARAMS["piq_condaenv"])
 
 @follows(mkdir("processed_bams.dir"))    
 @transform("*.bam", formatter(), "processed_bams.dir/{basename[0]}.RData")
 def process_bam(infile, outfile):
+    
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+    
+    # Temp file: We create a temp file to make sure the whole process goes well
+    # before the actual outfile is created
+    temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
 
     infile = os.path.abspath(infile)
     outfile = os.path.abspath(outfile)
     bam2rdata_script = os.path.join(PARAMS["PIQ_PATH"], "bam2rdata.r")
     statement = '''cd %(PIQ_PATH)s &&
-                   Rscript %(bam2rdata_script)s %(COMMONSCRIPT)s %(outfile)s %(infile)s'''
+                   Rscript %(bam2rdata_script)s %(COMMONSCRIPT)s %(temp_outfile)s %(infile)s && 
+                   mv %(temp_outfile)s %(outfile)s'''
     job_memory = "64G"
     
     P.run(statement, job_condaenv=PARAMS["piq_condaenv"])
