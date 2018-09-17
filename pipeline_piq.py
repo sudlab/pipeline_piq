@@ -131,48 +131,87 @@ def countMotifs(infile):
 @split(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"),
        ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt")))])
 def process_pwms(infile, outfiles):
+    '''Generate the PWM hits across genome. Checks to see which outfiles have already been created and
+    are newer than the infile and adds the rest to process'''
     
+    # Go through the outfiles and get the id of the files which are no created (normal strand AND rc)
+    # Also files which are newer than the infile
+    ids_remaining_to_process = []
+    
+    for outfile in outfiles:
+        
+        # Get the rc file 1000.pwmout.rc.RData - 1000.pwmout.RData
+        rc_outfile = P.snip(outfile, ".RData") + ".rc.RData"
+        
+        # Get the id of the file
+        id_outfile = P.snip(os.path.basename(outfile), ".pwmout.RData")
+        
+        
+        # If any of the files doesn't exist
+        if ( (not os.path.isfile(outfile)) or (not os.path.isfile(rc_outfile)) ):
+            
+            ids_remaining_to_process.append(id_outfile)
+        
+        # If any of the files is not newer than the infile
+        # Check only if both files already exist    
+        elif( (not(os.path.getctime(infile) < os.path.getctime(outfile))) or 
+            (not(os.path.getctime(infile) < os.path.getctime(rc_outfile))) ):
+            
+            ids_remaining_to_process.append(id_outfile)
+           
+            
     # Get the temp dir        
     tmp_dir = PARAMS["shared_tmpdir"]
     
-    # Create a temporary dir
-    output_temp_dir = tempfile.mkdtemp(dir=tmp_dir)
-
     statements = []
     statement = []
     match_script = os.path.join(PARAMS["PIQ_PATH"], "pwmmatch.exact.r")
     out_dir = os.path.dirname(os.path.abspath(outfiles[0]))
     job_memory = "8G"
     
-    statement_template = "Rscript %%(match_script)s %%(COMMONSCRIPT)s %%(infile)s %(i)i %%(output_temp_dir)s && mv %%(output_temp_dir)s/* %%(out_dir)s/"
+    # % gets substituted with %locals, %% gets substituted when submitting
+    statement_template = "Rscript %%(match_script)s %%(COMMONSCRIPT)s %%(infile)s %(i)i %(output_temp_dir)s && mv %(output_temp_dir)s/%(i)i.pwmout.*RData %%(out_dir)s/"
     
-    # Get the number of motifs in the file
-    num_motifs_file = countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"))
     
-    for i in range(1,(num_motifs_file+1),1):
+    # Variable to control the number of ids processed
+    id_num_counter = 1
+    
+    for id in ids_remaining_to_process:
         
-        # Everytime we begin a new chunk of statements we append cd PIQ_PATH
-        if((i-1)%PARAMS["chunk_size"] == 0):
+        # Convert the id to int
+        i = int(id)
+        
+        # Everytime we begin a new chunk of statements we create a new temporal dir 
+        # append cd PIQ_PATH
+        if((id_num_counter-1)%PARAMS["chunk_size"] == 0):
+            # Create a temporary dir
+            output_temp_dir = tempfile.mkdtemp(dir=tmp_dir)
             statement.append("cd %(PIQ_PATH)s && " + (statement_template % locals()))
         else:
             statement.append(statement_template % locals())
         
         # After we add the individual statement we concatenate statements in chunks of selected size     
         if len(statement) == PARAMS["chunk_size"]:
+            # Remove the temporal directory
+            statement.append("rm -rf %(output_temp_dir)s" % locals())
+            
             statements.append(" && ".join(statement))
             statement = []
-    
+        
+        # Update the number of ids processed
+        id_num_counter += 1
+        
     # Append the remaining statements
     
     # Remove the temporal directory
-    statement.append("rm -rf %(output_temp_dir)s")
+    statement.append("rm -rf %(output_temp_dir)s" % locals())
     
     statements.append(" && ".join(statement))
     
     
-    
-    
     P.run(statements, job_condaenv=PARAMS["piq_condaenv"])
+    
+    
 
 @follows(mkdir("processed_bams.dir"))    
 @transform("*.bam", formatter(), "processed_bams.dir/{basename[0]}.RData")
@@ -206,7 +245,12 @@ def process_bam(infile, outfile):
 def call_matches(infiles, outfile):
 
     bamfile, pwm = infiles
-
+    
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+    
+    output_temp_dir = tempfile.mkdtemp(dir=tmp_dir)
+    
     bamfile = os.path.abspath(bamfile)
     matchesdir = os.path.abspath(os.path.dirname(pwm))
     pwm_no = P.snip(os.path.basename(pwm), ".pwmout.RData")
@@ -217,11 +261,11 @@ def call_matches(infiles, outfile):
                    Rscript %(pertf_script)s 
                             %(COMMONSCRIPT)s 
                             %(matchesdir)s/  
-                            $TMPDIR 
+                            %(output_temp_dir)s 
                             %(outdir)s 
                             %(bamfile)s
                             %(pwm_no)s &&
-                  rm -rf $TMPDIR/* &&
+                  rm -rf %(output_temp_dir)s &&
                   touch %(outfile)s'''
 
     # Memory usage depends on input size
@@ -237,9 +281,9 @@ def call_matches(infiles, outfile):
 
     if size > 60:
         job_memory = "128G"
-    elif size > 45:
+    elif size > 38:
         job_memory = "64G"    
-    elif size > 30:
+    elif size > 22:
         job_memory = "32G"
     elif size > 15:
         job_memory = "16G"
