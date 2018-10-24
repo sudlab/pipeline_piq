@@ -3,7 +3,7 @@
 #
 # Pipeline pipeline_piq.py configuration file for sphinxreport
 #
-# This pipeline.ini file lists some configuration options that you might 
+# This pipeline.ini file lists some configuration options that you might
 # want a user to set automatically.
 #
 # Add pipeline specific options into separate sections
@@ -28,3 +28,78 @@ chunk_size: 6
 
 PIQ_PATH: /shared/sudlab1/General/apps/bio/PIQ_human
 piq_condaenv: alexia
+
+
+# The motif database to use, must be in JASPAR format, relative path from /shared/sudlab1/General/apps/bio/PIQ_human
+motif_db: pwms/jasparfix.txt
+
+
+# For the database file specified, the field number (separated by ;) where the gene name begins.
+# Examples:
+# -HOCOMOCO, field start = 0 /shared/sudlab1/General/apps/bio/PIQ_human/pwms/HOCOMOCOv11_core_pwm_HUMAN_mono_jaspar_format.txt
+  #>AHR_HUMAN.H11MO.0.B
+  #41      11      22      3       1       3       0       0       43
+  #18      12      44      1       150     1       3       0       67
+  #56      35      21      146     1       149     1       154     16
+  #39      96      67      4       2       1       150     0       28
+  #
+  # Gets AHR_HUMAN.H11MO.0.B as gene name
+#
+# -JASPAR, field_start = 1 /shared/sudlab1/General/apps/bio/PIQ_human/pwms/jasparfix.txt
+  #>MA0001.1;AGL3
+  #A  [ 0  3 79 40 66 48 65 11 65  0 ]
+  #C  [94 75  4  3  1  2  5  2  3  3 ]
+  #G  [ 1  0  3  4  1  0  5  3 28 88 ]
+  #T  [ 2 19 11 50 29 47 22 81  1  6 ]
+  #
+  # Gets AGL3 as gene name
+motif_db_gene_name_field_start: 1
+
+
+
+# Conversion table of bam files to peak files
+bam_to_peaks_conv_table: bam_peaks.txt
+
+# Minimum number of binding sites por motif after peak filtering
+min_binding_sites: 500
+
+# Protein coding genes TSS
+protein_coding_TSS: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/geneset.dir/coding_gene_tss.bed.gz
+
+# Non-protein coding genes TSS
+non_protein_coding_TSS: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/geneset.dir/noncoding_gene_tss.bed.gz
+
+# Distance to consider TSS upstream of a gene
+TSS_distance: 2500
+
+# Contig length
+contig_lengths: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/assembly.dir/contigs.tsv
+
+# Bed all contig length
+full_contig_bed: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/assembly.dir/contigs.bed.gz
+
+
+# Protein coding gene bodies
+protein_coding_gene_bodies: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/geneset.dir/coding_gene_region.bed.gz
+
+# Non protein coding gene bodies
+non_protein_coding_gene_bodies: /shared/sudlab1/General/annotations/hg38_noalt_ensembl85/geneset.dir/noncoding_gene_region.bed.gz
+
+# contigs to remove from the analysis
+# Does partial matching: for each element *element* is removed
+contigs_to_remove: _alt|_hap|chrM|_random|chrUn
+
+
+# Maximum number of edges (top interaction score) to show on the plot
+network_plots_max_edges: 100
+
+ensembl_gene_conda_env: /data/mbp15ja/extra_conda_envs/sharc
+
+gene_alternative_symbols_db: /shared/sudlab1/General/annotations/homo_sapiens_alt_gene_symbols/Homo_sapiens.gene_info.gz
+
+# Expression to be replaced by sed in the tables to shorten the gene symbols, can't include "/"
+replacing_strings_tables: _HUMAN.H11MO.0..
+
+
+# Shows these many top interaction_score edges per TF
+max_edges_show_per_tf: 80

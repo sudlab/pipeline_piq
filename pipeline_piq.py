@@ -2,6 +2,14 @@
 Pipeline template
 ===========================
 
+Requirements
+========
+
+-TF can't contain "-" After execution of the task "call_matches" this can be checked from the root folder with:
+find calls.dir -name "*params.RData" |  awk 'BEGIN {FS ="/"} {printf("%s\n", $3)}' | awk 'BEGIN {FS ="-"} {printf("%s\n", NF)}' | sort | uniq | wc -l
+# Should return 1
+-conda install -c conda-forge networkx=2.2
+
 .. Replace the documentation below with your own description of the
    pipeline's purpose
 
@@ -71,11 +79,16 @@ import CGATCore.IOTools as IOTools
 import glob
 import tempfile
 import pipelinePIQ
-from ruffus import transform, regex, suffix, follows, mkdir, split, formatter, collate
+from ruffus import transform, regex, suffix, follows, mkdir, split, formatter, collate, subdivide, originate, add_inputs, files, merge
 from ruffus.combinatorics import product
 
 
 from CGATCore import Pipeline as P
+from shutil import copyfile
+from os import listdir
+import re
+import pandas as pd
+
 
 # load options from the config file
 PARAMS = P.get_parameters(
@@ -128,8 +141,8 @@ def countMotifs(infile):
 # ---------------------------------------------------
 # Specific pipeline tasks
 @follows(mkdir("motif.matchs"))
-@split(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt"),
-       ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(countMotifs(os.path.join(PARAMS["PIQ_PATH"], "pwms/jasparfix.txt")))])
+@split(os.path.join(PARAMS["PIQ_PATH"], PARAMS["motif_db"]),
+       ["motif.matchs/%i.pwmout.RData" % (i+1) for i in range(countMotifs(os.path.join(PARAMS["PIQ_PATH"], PARAMS["motif_db"])))])
 def process_pwms(infile, outfiles):
     '''Generate the PWM hits across genome. Checks to see which outfiles have already been created and
     are newer than the infile and adds the rest to process'''
@@ -152,10 +165,10 @@ def process_pwms(infile, outfiles):
             
             ids_remaining_to_process.append(id_outfile)
         
-        # If any of the files is not newer than the infile
+        # If any of the files is not newer than the infile (modification time)
         # Check only if both files already exist    
-        elif( (not(os.path.getctime(infile) < os.path.getctime(outfile))) or 
-            (not(os.path.getctime(infile) < os.path.getctime(rc_outfile))) ):
+        elif( (not(os.path.getmtime(infile) < os.path.getmtime(outfile))) or
+            (not(os.path.getmtime(infile) < os.path.getmtime(rc_outfile))) ):
             
             ids_remaining_to_process.append(id_outfile)
            
@@ -201,12 +214,16 @@ def process_pwms(infile, outfiles):
         # Update the number of ids processed
         id_num_counter += 1
         
-    # Append the remaining statements
+    # Append the remaining statements.
+    # There are only remaining statements
+    # if len(statement) != PARAMS["chunk_size"])
+    # (id_num_counter-1)%PARAMS["chunk_size"] != 0 (The counter is updated at the end of the for loop above)
+
+    if not ((id_num_counter - 1) % PARAMS["chunk_size"] == 0):
+        # Remove the temporal directory
+        statement.append("rm -rf %(output_temp_dir)s" % locals())
     
-    # Remove the temporal directory
-    statement.append("rm -rf %(output_temp_dir)s" % locals())
-    
-    statements.append(" && ".join(statement))
+        statements.append(" && ".join(statement))
     
     
     P.run(statements, job_condaenv=PARAMS["piq_condaenv"])
@@ -287,7 +304,7 @@ def call_matches(infiles, outfile):
         job_memory = "32G"
     elif size > 15:
         job_memory = "16G"
-    elif size > 5:
+    elif size > 3:
         job_memory = "8G"
     else:
         job_memory = "4G"
@@ -295,7 +312,6 @@ def call_matches(infiles, outfile):
     P.run(statement, job_condaenv = PARAMS["piq_condaenv"])
     
     
-
 
 @follows(call_matches,
          mkdir("calls_filtered.dir"))
@@ -305,11 +321,9 @@ def call_matches(infiles, outfile):
            "{SAMPLE[0]}",
            "{PWM[0]}")
 def filter_matches(infiles, outfile, sample, pwm):
-    
+    '''Produces empty outfiles when there is nothing to process'''
+    # Either 3 or 6 files can be captured (in some cases the RC are not obtained).
    
-    if(len(infiles) != 6):
-        raise Exception("All the call files are not produced")
-    
     # If the directory for the sample doesn't exist, create it
     if not os.path.exists(os.path.dirname(outfile)):
         os.makedirs(os.path.dirname(outfile))
@@ -333,77 +347,1588 @@ def filter_matches(infiles, outfile, sample, pwm):
                 RC_calls_sign_file=infile
             else:
                 calls_sign_file=infile
+                
+    
+    both_calls_present = True
+    both_RC_calls_present = True
+                
+    # We need to have the files in pairs (calls and calls.all)
+    if(calls_all_file == "" or calls_sign_file == ""):
+        both_calls_present = False
+        
+    if(RC_calls_all_file == "" or RC_calls_sign_file == ""):
+        both_RC_calls_present = False
+
+
+
+
+
+    # Due to the filtering, we can get significant result files which only have the header (are empty)
+    # We can also get tables with NA results which have to be disregarded
+
+
+    empty_calls_sign_file = False
+
+    # Check the file only if both calls are present
+    if(both_calls_present):
+
+        # Forward strand empty file or containing NA's
+        with open(calls_sign_file) as f:
+            for index, line in enumerate(f):
+                line = line.rstrip('\n')
+
+                # separate by ,
+                fields = line.split(",")
+
+                # If one NA is found, we consider the file empty
+                # Will only match "NA", not a string containing "NA"
+                if("NA" in fields):
+                    empty_calls_sign_file = True
+                    break
+
+        f.close()
+        if(index + 1 <= 1):
+            empty_calls_sign_file = True
+
+
+
+
+    empty_RC_calls_sign_file = False
+
+    # Check the file only if both calls are present
+    if (both_RC_calls_present):
+
+        with open(RC_calls_sign_file) as f:
+            for index, line in enumerate(f):
+                line = line.rstrip('\n')
+
+                # separate by ,
+                fields = line.split(",")
+
+                # If one NA is found, we consider the file empty
+                # Will only match "NA", not a string containing "NA"
+                if ("NA" in fields):
+                    empty_RC_calls_sign_file = True
+                    break
+
+        f.close()
+        if (index + 1 <= 1):
+            empty_RC_calls_sign_file = True
+
+
+    # To proceed, for each forward and reverse strand calls, all files must be present and the significant file
+    # must not be empty or contain "NA"
+    both_calls_present = both_calls_present and not empty_calls_sign_file
+    both_RC_calls_present = both_RC_calls_present and not empty_RC_calls_sign_file
+
+
+    # If there is nothing to process there is probably an error upstream    
+    if( (not both_calls_present) and (not both_RC_calls_present)):
+        # Nothing to process
+        statement = '''touch %(outfile)s'''
+
+        job_memory = "2G"
+
+        P.run(statement)
+
+
+    else:
+    
+        # Get the temp dir
+        tmp_dir = PARAMS["shared_tmpdir"]
+
+        # Temp file: We create a temp file to make sure the whole process goes well
+        # before the actual outfile is created
+
+        # Processing of the files containing all calls
+        temp_file_all_calls = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+        temp_file_all_calls_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+        # Processing of the files containing significant calls
+        temp_file_calls_sign = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+        temp_file_calls_sign_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+
+
+        # The first step is to remove the header from both files and filter individually the
+        # significant motifs
+        # Output the rest of the file adding a numeric count starting at 1
+        # For the significant calls, we keep the row number and corresponding purity
+
+        statement = ''''''
+
+        if both_calls_present:
+
+            statement = '''cat %(calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls)s  &&
+                
+                            cat %(calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1,7 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign)s '''
+
+        if both_RC_calls_present:
+
+            # Check if the statement already contains information
+            if both_calls_present:
+
+                statement += ''' && '''
+
+            # At this point the statement can be either empty or contain the previous statement, in each case we add to it
+            statement += ''' cat %(RC_calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls_RC)s  && 
+            
+                            cat %(RC_calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1,7 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign_RC)s '''
+
+        job_memory = "2G"
+
+        P.run(statement)
+
+
+        # Processing of the bed files to select significant calls
+        temp_file_calls_sign_bed = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+        temp_file_calls_sign_bed_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+        # Now merge the tables to select only significant calls in bed format
+
+        if both_calls_present:
+            pipelinePIQ.filterSignCalls(temp_file_all_calls,
+                            temp_file_calls_sign,
+                            temp_file_calls_sign_bed)
+
+        if both_RC_calls_present:
+            pipelinePIQ.filterSignCalls(temp_file_all_calls_RC,
+                        temp_file_calls_sign_RC,
+                        temp_file_calls_sign_bed_RC)
+
+
+        # Create temp output
+        temp_output = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+
+        # Now concatenate both bed files and sort by chr and start
+        # Delete all temporal files
+        statement = "zcat "
+
+        if both_calls_present:
+
+            statement += ''' %(temp_file_calls_sign_bed)s '''
+
+        if both_RC_calls_present:
+
+            statement += ''' %(temp_file_calls_sign_bed_RC)s '''
+
+        statement += ''' | sort -k 1,1 -k2,2n | gzip > %(temp_output)s && 
+        rm %(temp_file_all_calls)s %(temp_file_all_calls_RC)s %(temp_file_calls_sign)s %(temp_file_calls_sign_RC)s %(temp_file_calls_sign_bed)s %(temp_file_calls_sign_bed_RC)s && 
+        mv %(temp_output)s %(outfile)s '''
+
+        job_memory = "2G"
+
+        P.run(statement)
+
+
+
+
+
+
+@follows(mkdir("calls_filtered_peaks.dir"))    
+@transform(filter_matches,
+         formatter("calls_filtered.dir/(?P<SAMPLE>.+)/(?P<PWM>.+?)-calls.sign.bed.gz"),
+         "calls_filtered_peaks.dir/{SAMPLE[0]}/{PWM[0]}-calls.in_peaks.bed.gz",
+         "{SAMPLE[0]}")                
+def filter_matches_in_peaks(infile, outfile, sample):
+    ''' Removing regions which don’t fall on the corresponding MM subgroup/PC peaks. 
+    We need to get all the consensus peaks from each of the samples.
+    Preferably by merging all the samples reads (downsampling the number of single ends to 
+    the sample with the lowest number of single ends from all samples)”, pooling each subgroup 
+    samples and calling peaks.
+    Can receive and return an empty file'''
+    
+    # Get the table        
+    bam_to_peaks_table = PARAMS["bam_to_peaks_conv_table"]
+    
+    # Get the bam file from the sample name
+    bam_file = sample + ".bam"
+    
+    # Get table to decide the corresponding peaks file
+    peaks_file = pipelinePIQ.getPeaksFileFromBam(bam_to_peaks_table, bam_file)
+    
+    # Create the directory if it's not created
+    outdir = os.path.dirname(outfile)
+    
+    # Bedtools intersect is giving tab separation errors, we use bedops
+    # Seems to get infile as tuple
+    statement = '''mkdir -p %(outdir)s && 
+    bedops --element-of 1 <(zcat %(infile)s ) <(zcat %(peaks_file)s) | gzip > %(outfile)s'''
+    
+    job_memory = "2G"
+    
+    P.run(statement)
+    
+    
+
+
+
+@follows(mkdir("calls_filtered_min_bind_sites.dir"))
+@collate(filter_matches_in_peaks,
+           formatter("calls_filtered_peaks.dir/(?P<SAMPLE>.+)/.*-calls.in_peaks.bed.gz"),
+           "calls_filtered_min_bind_sites.dir/{SAMPLE[0]}/samples_with_min_sites.txt")
+def filter_matches_min_bind_sites_get_complying_files(infiles, outfile):
+    
+    # Get the minimum number of binding sites
+    min_binding_sites = PARAMS["min_binding_sites"]
+    
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    
+    # Write on the outfile which TFs of the sample comply 
+    with IOTools.open_file(outfile, "w") as writer:
+    
+        for infile in infiles:
+            
+            # To prevent 0 length files to pass
+            length = 0
+            i = 0
+            l = ""
+            
+            with IOTools.open_file(infile, "r") as reader:
+                
+                for i, l in enumerate(reader):
+                    pass
+            
+            reader.close()
+
+            length = i + 1
+
+            # 0 length files have i = 0 and l = ""
+            # 1 length files have i = 0 and l != ""
+            if i == 0 and l == "":
+                length = 0
+
+            # If it has the minimum length, copy the file
+            if(length >= min_binding_sites):
+                
+                writer.write(infile+"\n")
+            
+    writer.close()        
+
+
+
+
+
+@subdivide(filter_matches_min_bind_sites_get_complying_files,
+           formatter("calls_filtered_min_bind_sites.dir/(?P<SAMPLE>.+)/samples_with_min_sites.txt"),
+           "calls_filtered_min_bind_sites.dir/{SAMPLE[0]}/*-min_bind_sites.bed.gz",
+           "calls_filtered_min_bind_sites.dir/{SAMPLE[0]}") # Output directory
+def filter_matches_min_bind_sites_copy_complying_files(infile, outfiles, output_dir_path):
+    
+    # The files from the previous run need to be deleted (previous run files may have been
+    # generated which will not be generated now and they will remain)
+    for file_in_path in listdir(output_dir_path):
+        
+        file_full_path = os.path.join(output_dir_path, file_in_path)
+        
+        if os.path.isfile(file_full_path):
+            
+            # If it's not a samples_with_min_sites.txt
+            if (not os.path.basename(file_full_path) == os.path.basename(infile)):
+            
+                os.unlink(file_full_path)
+    
+    with IOTools.open_file(infile, "r") as reader:
+        
+        for line in reader:
+
+            file_to_copy = line.rstrip('\n')
+        
+            # Get the directory path
+            new_dir = os.path.dirname(file_to_copy).replace("calls_filtered_peaks.dir",
+                                                      "calls_filtered_min_bind_sites.dir") 
+             
+            # Get the name
+            new_name = os.path.basename(file_to_copy).replace("-calls.in_peaks.bed.gz",
+                                                        "-min_bind_sites.bed.gz")
+             
+            new_outfile = os.path.join(new_dir,
+                                       new_name)
+             
+            # Copy the file
+            copyfile(file_to_copy,
+                     new_outfile)    
+
+             
+        
+     
+    reader.close()
+             
+               
+
+
+@follows(mkdir("TSS_regions.dir"))
+@originate("TSS_regions.dir/all_genes_"+str(PARAMS["TSS_distance"])+"bp_upstream_TSS.bed.gz") 
+def generate_TSS_upstream(outfile):
+    '''Get the region upstream specified of its transcription start site for all the protein 
+    coding and non protein coding genes.
+    Excludes unwanted contigs'''
+    
+    TSS_distance = PARAMS["TSS_distance"]
+    
+    protein_coding_TSS = PARAMS["protein_coding_TSS"]
+
+    non_protein_coding_TSS = PARAMS["non_protein_coding_TSS"]
+    
+    contig_lengths = PARAMS["contig_lengths"]
+    
+    unwanted_chrs = PARAMS["contigs_to_remove"]
+    
+    # Concatenate both gene sets, make sure no genes are repeated (gene id repeated)
+    # and sort by coordinate and slop -2500bp upstream
+    statement = '''zcat %(protein_coding_TSS)s %(non_protein_coding_TSS)s | awk -F"\\t" '!seen[$4]++' | sort -k1,1 -k2,2n 
+    | bedtools slop -s -l %(TSS_distance)s -r 0 -i stdin -g %(contig_lengths)s | egrep -v '(%(unwanted_chrs)s)' | gzip > %(outfile)s '''
+    
+    job_memory = "2G"
+    
+    P.run(statement)
+
+
+@follows(mkdir("TSS_ensembl_symb.dir"))
+@originate("TSS_ensembl_symb.dir/conv_table.tsv.gz")
+def generate_TSS_ensembl_symb_conv_table(outfile):
+    '''Gets all the TSS coding and non-coding genes and obtains the gene symbols for each into a table'''
+
+    protein_coding_TSS = PARAMS["protein_coding_TSS"]
+
+    non_protein_coding_TSS = PARAMS["non_protein_coding_TSS"]
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Temporal file with header containing all ensembl ids used
+    genes_and_TSS_unsorted = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+
+    # Output a file header
+    # Concatenate both gene sets, make sure no genes are repeated (gene id repeated)
+    # and output the unique ensembl ids
+    statement = '''printf "id\\n" > %(genes_and_TSS_unsorted)s && zcat %(protein_coding_TSS)s %(non_protein_coding_TSS)s | awk -F"\\t" '!seen[$4]++' | cut -f 4 >> %(genes_and_TSS_unsorted)s '''
+
+    job_memory = "2G"
+
+    P.run(statement)
+
+    # Temporal file with header containing all ensembl ids used
+    genes_conv_table_temp = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    # Now get the ensembl ids and gene descriptions
+    statement = '''module load my_apps/sharc-R/3.3.2 && Rscript /home/mbp15ja/dev/pipelines_py3/pipeline_piq/EnsemblTable2Symbols_Maintain_order_field.R %(genes_and_TSS_unsorted)s 0 TRUE FALSE %(genes_conv_table_temp)s && 
+    cat %(genes_conv_table_temp)s | gzip > %(outfile)s && rm %(genes_and_TSS_unsorted)s %(genes_conv_table_temp)s'''
+
+    P.run(statement)
+
+
+
+
+@follows(mkdir("generate_TSS_alt_symbols.dir"))
+@transform(generate_TSS_ensembl_symb_conv_table,
+           formatter(),
+           "generate_TSS_alt_symbols.dir/tss_alt_symbols.tsv.gz")
+def generate_alt_symbols(infile, outfile):
+    '''Looks up the gene ids TSS in a database to get all possible alternative gene symbols. Stores all symbols with capital letters'''
+
+    gene_alt_db = PARAMS["gene_alternative_symbols_db"]
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Temporal file
+    temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Temporal file
+    headerless_temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Get the headerless infile
+    # Go through each line from the TSS ensembl_id, gene symbol, description table
+    # Output the ensembl_id, gene symbol
+    # Check if there is a unique ensembl id hit in the database (grep with no lines returns a 1 exit code, hence || true)
+    # and retrieve all alternative gene symbols
+    # Output the alternative gene symbols in the same line if there are
+    # Print new line character
+    statement = '''zcat %(infile)s | tail -n +2 > %(headerless_temp_outfile)s;
+    
+    while read p; do
+    ensembl_gene_id=$(echo "$p" | cut -f 1);
+
+    ensembl_main_gene_symbol=$(echo "$p" | cut -f 2);
+
+    printf "$ensembl_gene_id\\t$ensembl_main_gene_symbol" >> %(temp_outfile)s;
+
+    conversion_lines=$(zcat %(gene_alt_db)s | grep "$ensembl_gene_id" || true);
+
+    num_lines=$(printf "$conversion_lines" | wc -l);
+
+    if [ ! -z "$conversion_lines" ]; then
+
+       if [ "$num_lines" -eq 0 ]; then
+           alt_names=$(echo "$conversion_lines" | cut -f3,5,11 | sed -e 's/|/\\t/g');
+           printf "\\t$alt_names" >> %(temp_outfile)s;
+       fi;
+    fi;
+
+    printf "\\n" >> %(temp_outfile)s;
+
+    done < %(headerless_temp_outfile)s'''
+
+    job_memory = "2G"
+
+    P.run(statement)
+
+    # Delete redundant symbols per line keeping the first column being the primary symbol and the subsequent columns being tab separated
+    # alternative names
+    # Delete redundant symbols per line keeping the first column being the primary symbol and the subsequent columns being tab separated
+    # alternative names
+    with IOTools.open_file(outfile, "w") as writer:
+
+        with IOTools.open_file(temp_outfile, "r") as reader:
+
+            for line in reader:
+
+                # Remove the new line character from the line (avoids taking this into account downstream)
+                line = line.rstrip('\n')
+
+                # Get all symbols except the ensembl id (column 0)
+                symbols = line.split("\t")[1:]
+
+                # Convert the symbols to capital letters
+                capital_symbols = [x.upper() for x in symbols]
+
+                prim_symbol = capital_symbols[0]
+
+                # Get the unique symbols
+                unique_symbols = set(capital_symbols)
+
+                # If the length is not 0
+                if len(unique_symbols) != 0:
+                    # Remove the primary symbol
+                    unique_symbols.discard(prim_symbol)
+
+                if len(unique_symbols) != 0:
+                    # Remove any empty strings
+                    unique_symbols.discard("")
+
+                if len(unique_symbols) != 0:
+                    # Remove any -
+                    unique_symbols.discard("-")
+
+                    # Convert to list
+                    unique_symbols = list(unique_symbols)
+                else:
+                    # Empty list
+                    unique_symbols = []
+
+                if len(unique_symbols) == 0:
+                    writer.write(prim_symbol + "\n")
+                else:
+                    writer.write(prim_symbol + "\t" + "\t".join(unique_symbols) + "\n")
+
+        reader.close()
+
+    writer.close()
+
+    # Delete the temp files
+    os.unlink(temp_outfile)
+    os.unlink(headerless_temp_outfile)
+
+
+
+
+
+
+@follows(mkdir("TSS_regions_and_gene_bodies.dir"))
+@transform(generate_TSS_upstream,
+           formatter(),
+           [r"TSS_regions_and_gene_bodies.dir/genes_and_tss_coverage.sorted.bed.gz",
+           r"TSS_regions_and_gene_bodies.dir/all_genes_body.bed.gz"]) 
+def generate_TSS_upstream_with_gene_body(infile, outfiles):
+    ''' Gets the gene bodies from all protein coding and non-coding regions into a file. 
+    Merges for each gene, the gene body and the 2,500bp region upstream of the TSS.
+    Excludes unwanted contigs '''
+    
+    genes_and_TSS, gene_body_only = outfiles
+    
+    
+    protein_coding_gene_bodies = PARAMS["protein_coding_gene_bodies"]
+ 
+    non_protein_coding_gene_bodies = PARAMS["non_protein_coding_gene_bodies"]
+     
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+    
+    unwanted_chrs = PARAMS["contigs_to_remove"]
+    
+    
+    statement = '''zcat %(protein_coding_gene_bodies)s %(non_protein_coding_gene_bodies)s | egrep -v '(%(unwanted_chrs)s)' 
+    | awk -F"\\t" '!seen[$4]++' | sort -k1,1 -k2,2n | gzip > %(gene_body_only)s'''
+    
+    job_memory = "2G"
+     
+    P.run(statement)
+    
+    
+    
+    # Temporal file to sort later
+    genes_and_TSS_unsorted = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    
+    
+    # Now for each gene, merge the regions (gene body and 2500bp upstream of the TSS). 
+    # Any space between these two regions for each gene is considered to be part of the region too. 
+    # Both input lists are checked to have the same genes.
+    pipelinePIQ.merge_TSS_gene_body_per_gene(gene_body_only,
+                                             infile,
+                                             genes_and_TSS_unsorted)
+    
+    # Sort the file
+    # Remove the temp file
+    statement = '''zcat %(genes_and_TSS_unsorted)s | sort -k1,1 -k2,2n | gzip > %(genes_and_TSS)s && rm %(genes_and_TSS_unsorted)s'''
+    
+    job_memory = "2G"
+     
+    P.run(statement)
+    
+    
+
+@follows(mkdir("motifs_assigned_to_TSS_regions_and_gene_bodies.dir"))
+@transform(filter_matches_min_bind_sites_copy_complying_files,
+           formatter("calls_filtered_min_bind_sites.dir/(?P<SAMPLE>.+)/(?P<TF>.+)-min_bind_sites.bed.gz"),
+           add_inputs(generate_TSS_upstream_with_gene_body),
+           "motifs_assigned_to_TSS_regions_and_gene_bodies.dir/{SAMPLE[0]}/{TF[0]}-TSS.tsv.gz")
+def assign_filtered_motifs_to_gene_body_TSS(infiles, outfile):
+    '''Assign for each binding site, the gene body + TSS region they overlap (can be multiple).
+    Any strand and majority of length.
+    Excludes unwanted contigs'''
+    
+    binding_site_matches = infiles[0]
+    
+    gene_regions_TSS_gene_body = infiles[1][0]
+    
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    
+    statement = '''bedtools intersect -wo -f 0.51 
+    -a <(zcat %(binding_site_matches)s) -b %(gene_regions_TSS_gene_body)s | cut -f 1-6,10 | 
+    gzip > %(outfile)s '''
+    
+    job_memory = "2G"
+     
+    P.run(statement)
+
+
+
+@follows(mkdir("intergenic_regions.dir"))
+@transform(generate_TSS_upstream_with_gene_body,
+           formatter(),
+           "intergenic_regions.dir/intergenic.sorted.bed.gz")
+def generate_intergenic_regions(infile, outfile):
+    '''Gets the intergenic regions (not gene bodies + TSS).
+    Non strand aware.
+    Removes unwanted chromosomes. '''
+    
+    full_contig_bed = PARAMS["full_contig_bed"]
+    
+    generate_TSS_upstream_with_gene_body = infile[0]
+    
+    unwanted_chrs = PARAMS["contigs_to_remove"]
+    
+    statement = '''bedtools subtract -a <(zcat %(full_contig_bed)s | egrep -v '(%(unwanted_chrs)s)' | sort -k1,1) 
+    -b %(generate_TSS_upstream_with_gene_body)s | sort -k1,1 -k2,2n | gzip > %(outfile)s'''
+    
+    job_memory = "2G"
+     
+    P.run(statement)
+    
+
+
+
+@follows(mkdir("motifs_assigned_to_intergenic_regions.dir"))
+@transform(filter_matches_min_bind_sites_copy_complying_files,
+           formatter("calls_filtered_min_bind_sites.dir/(?P<SAMPLE>.+)/(?P<TF>.+)-min_bind_sites.bed.gz"),
+           add_inputs(generate_intergenic_regions),
+           "motifs_assigned_to_intergenic_regions.dir/{SAMPLE[0]}/{TF[0]}-TSS.tsv.gz")    
+def assign_filtered_motifs_to_intergenic_regions(infiles, outfile):
+    '''Get the binding sites which fall (51% or more in length) on intergenic regions (non strand aware).
+    Assign these binding sites to the closest gene TSS.'''
+    
+    binding_site_matches = infiles[0]
+    
+    gene_regions_intergenic = infiles[1]
+    
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
     
     # Get the temp dir        
     tmp_dir = PARAMS["shared_tmpdir"]
     
-    # Temp file: We create a temp file to make sure the whole process goes well
-    # before the actual outfile is created
+    # Temporal containing binding sites in integenic regions
+    binding_sites_in_intergenic = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
     
-    # Processing of the files containing all calls
-    temp_file_all_calls = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    protein_coding_TSS = PARAMS["protein_coding_TSS"]
     
-    temp_file_all_calls_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
-
-    # Processing of the
-    temp_file_calls_sign = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
-    
-    temp_file_calls_sign_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    non_protein_coding_TSS = PARAMS["non_protein_coding_TSS"] 
     
     
-            
-    # The first step is to remove the header from both files and filter individually the
-    # significant motifs
-    # Output the rest of the file adding a numeric count starting at 1
-    statement = '''cat %(calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls)s  &&
-        
-    cat %(RC_calls_all_file)s | tail -n +2 | awk 'BEGIN {FS ="\\t"} {printf("%%s\\t%%s\\n", NR, $0)}' | gzip > %(temp_file_all_calls_RC)s  &&
+    # Binding sites which fall (51% or more in length) on intergenic regions (non strand aware)
+    # Assign these binding sites to the closest gene TSS (can be 2: one from each strand)
+    # For the binding sites in intergenic regions, get the closest TSS gene to assign (non strand-aware)
+    # If there are 2 TSS at the same distance from one binding site report both (2 rows with different genes)
+    # Zcat to avoid bugs
+    # Make sure there are no replicated genes (by gene id) in the protein coding and non-protein coding TSS
+    statement = '''bedtools intersect -u -f 0.51 -a <(zcat %(binding_site_matches)s) 
+    -b %(gene_regions_intergenic)s | gzip > %(binding_sites_in_intergenic)s && 
+    bedtools closest -t all -a <(zcat %(binding_sites_in_intergenic)s) 
+    -b <(zcat %(protein_coding_TSS)s %(non_protein_coding_TSS)s | awk -F"\\t" '!seen[$4]++' | sort -k1,1 -k2,2n) | 
+    cut -f 1-6,10 | gzip > %(outfile)s && 
+    rm %(binding_sites_in_intergenic)s'''
     
-    cat %(calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign)s  &&
-        
-    cat %(RC_calls_sign_file)s | tail -n +2 | sed -e 's/,/\\t/g' | cut -f 1 | sed -e 's/"//g' | gzip > %(temp_file_calls_sign_RC)s '''
-    
-    P.run(statement)
-    
-    
-    # Processing of the bed files to select significant calls
-    temp_file_calls_sign_bed = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
-    
-    temp_file_calls_sign_bed_RC = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
-    
-    # Now merge the tables to select only significant calls in bed format
-    pipelinePIQ.filterSignCalls(temp_file_all_calls,
-                    temp_file_calls_sign,
-                    temp_file_calls_sign_bed)
-    
-    pipelinePIQ.filterSignCalls(temp_file_all_calls_RC,
-                    temp_file_calls_sign_RC,
-                    temp_file_calls_sign_bed_RC)
-    
-    
-    # Create temp output
-    temp_output = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
-    
-    
-    
-    # Now concatenate both bed files and sort by chr and start
-    # Delete all temporal files 
-
-    statement = '''zcat %(temp_file_calls_sign_bed)s %(temp_file_calls_sign_bed_RC)s | sort -k 1,1 -k2,2n | gzip > %(temp_output)s && 
-    rm %(temp_file_all_calls)s %(temp_file_all_calls_RC)s %(temp_file_calls_sign)s %(temp_file_calls_sign_RC)s %(temp_file_calls_sign_bed)s %(temp_file_calls_sign_bed_RC)s && 
-    mv %(temp_output)s %(outfile)s '''
-    
+    job_memory = "2G"
+     
     P.run(statement)
     
 
-   
-       
+
+@follows(mkdir("motifs_assigned_to_all_regions.dir"),
+         assign_filtered_motifs_to_gene_body_TSS)   
+@transform(assign_filtered_motifs_to_intergenic_regions,
+           formatter("motifs_assigned_to_intergenic_regions.dir/(?P<SAMPLE>.+)/(?P<TF>.+)-TSS.tsv.gz"),
+           add_inputs("motifs_assigned_to_TSS_regions_and_gene_bodies.dir/{SAMPLE[0]}/{TF[0]}-TSS.tsv.gz"),
+           "motifs_assigned_to_all_regions.dir/{SAMPLE[0]}/{TF[0]}-TSS.tsv.gz")
+def merge_filtered_motifs_in_all_regions(infiles, outfile):
+    '''Concatenate the binding sites with the closest gene in all regions'''
+    
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    
+    intergenic_binding_sites, tss_gene_body_sites = infiles
+    
+    statement = '''zcat %(intergenic_binding_sites)s %(tss_gene_body_sites)s | sort -k7,7 | gzip > %(outfile)s'''
+    
+    job_memory = "2G"
+    
+    P.run(statement)
 
 
 
-# ---------------------------------------------------
-# Generic pipeline tasks
-@follows(filter_matches)
+
+@follows(mkdir("distance_motif_gene.dir"))
+@transform(merge_filtered_motifs_in_all_regions,
+           formatter("motifs_assigned_to_all_regions.dir/(?P<SAMPLE>.+)/(?P<TF>.+)-TSS.tsv.gz"),
+           "distance_motif_gene.dir/{SAMPLE[0]}/{TF[0]}-TSS.tsv.gz")
+def calculate_distance_motif_gene(infile, outfile):
+    
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    
+    # Get the temp dir        
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    protein_coding_TSS = PARAMS["protein_coding_TSS"]
+    
+    non_protein_coding_TSS = PARAMS["non_protein_coding_TSS"]
+    
+    # Temporal containing purities sorted
+    file_with_purities_sorted = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    # Temporal containing unique genes
+    unique_genes = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    binding_sites_gene = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    tss_gene = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    output_file_temp = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+    
+    # Get uniq genes
+    # Coordinate sort and store the file
+    # Remove the outfile (from before)
+    
+    # Iterate through the gene ids
+    # Get the binding sites corresponding to that gene_id
+    # Get the location of the TSS for that gene id, in case a gene is repeated, get unique rows
+    # Append this into the file
+    # Sort by gene name, remove temp
+    statement = '''zcat %(infile)s | cut -f 7 | sort | uniq > %(unique_genes)s && 
+    zcat %(infile)s | sort -k 1,1 -k2,2n | gzip > %(file_with_purities_sorted)s && 
+    rm -f %(outfile)s &&
+    
+    
+    while read gene_id; do
+    
+    
+    zcat %(file_with_purities_sorted)s | grep "$gene_id" > %(binding_sites_gene)s;
+  
+    
+    zcat %(protein_coding_TSS)s %(non_protein_coding_TSS)s | awk -F"\\t" '!seen[$4]++' | grep "$gene_id" > %(tss_gene)s;
+  
+    num_lines=$(cat %(tss_gene)s | wc -l);
+    
+    if [ "$num_lines" -ne 1 ]; then
+        echo "More than one gene";
+        cat %(tss_gene)s;
+        exit 1;
+    fi;
+    
+    
+    bedtools closest -d -a %(binding_sites_gene)s -b %(tss_gene)s | cut -f1-7,14 >> %(output_file_temp)s;
+
+  
+    done < %(unique_genes)s;
+
+    
+    cat %(output_file_temp)s | sort -k7,7 | gzip > %(outfile)s && rm %(file_with_purities_sorted)s %(unique_genes)s %(binding_sites_gene)s %(tss_gene)s %(output_file_temp)s; '''
+
+    job_memory = "4G"
+    
+    P.run(statement)    
+
+
+
+@follows(mkdir("interaction_score_TF_gene.dir"))
+@transform(calculate_distance_motif_gene,
+           formatter("distance_motif_gene.dir/(?P<SAMPLE>.+)/(?P<TF>.+)-TSS.tsv.gz"),
+           "interaction_score_TF_gene.dir/{SAMPLE[0]}/{TF[0]}.tsv.gz")
+def calculate_interaction_score(infile, outfile):
+    '''For each TF and gene calculates the interaction score as per Rendeiro et. al 2016'''
+
+    # Create the sample directory if it doesn't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    
+    pipelinePIQ.calculateInteractionScore(infile,
+                                          outfile,
+                                          submit=True,
+                                          job_memory="2G")
+
+
+
+@follows(mkdir("interaction_score_histogram.dir"))
+@merge(calculate_interaction_score,
+       "interaction_score_histogram.dir/histogram.png")
+def generate_histogram_interaction_scores(infiles, outfile):
+
+    # The first step is to get only the interaction scores for each file
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    job_memory = "2G"
+
+    # Temporal containing purities sorted
+    all_interaction_scores = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Create an empty statement
+    statement = ""
+
+
+    for infile in infiles:
+
+        # If the statement is not the first append "&&"
+        if infiles[0] != infile:
+            statement += ''' && '''
+
+        statement += '''zcat ''' +infile+ ''' | tail -n +2 | cut -f 2 >> %(all_interaction_scores)s'''
+
+    P.run(statement)
+
+    # Temporal containing purities sorted
+    output_hist_temp = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Create the histogram
+    pipelinePIQ.histogramFromOneDValues(all_interaction_scores,
+                                            100,
+                                            output_hist_temp,
+                                            submit=True,
+                                            job_memory="4G")
+
+    # Delete the temporary files
+    # Copy the temporary file to the outfile
+    statement = '''rm %(all_interaction_scores)s;
+
+                    mv %(output_hist_temp)s %(outfile)s;
+
+                    '''
+
+    P.run(statement)
+
+
+
+
+@follows(mkdir("motif_gene_conv_table.dir"))
+@transform(os.path.join(PARAMS["PIQ_PATH"], PARAMS["motif_db"]),
+           formatter(),
+           "motif_gene_conv_table.dir/motif_gene_conv_table.tsv.gz")
+def generate_motif_gene_conv_table(infile, outfile):
+    ''' Gets the motif id from the database used and extracts the corresponding gene symbol'''
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Get database gene field start (separated by ;) for the gene
+    field_start_db = PARAMS["motif_db_gene_name_field_start"]
+
+    job_memory = "2G"
+
+    temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    pipelinePIQ.getMotifGeneTablePIQJasparfix(infile, temp_outfile, field_start_db)
+
+
+    # Gzip the file and delete the temporal file
+    statement = '''cat %(temp_outfile)s | gzip > %(outfile)s && rm %(temp_outfile)s'''
+
+    P.run(statement)
+
+
+
+@follows(mkdir("TF_TSS_gene_conv.dir"))
+@transform(generate_TSS_ensembl_symb_conv_table,
+           formatter(),
+           add_inputs(generate_motif_gene_conv_table),
+           ["TF_TSS_gene_conv.dir/TF_contained_in_TSS.tsv.gz",
+            "TF_TSS_gene_conv.dir/TSS_contained_in_TF.tsv.gz",
+            "TF_TSS_gene_conv.dir/common_ids.gz"])
+def get_contained_tf_gene_conversions(infiles, outfiles):
+    ''' Gets gene symbols which are from the TFs contained in gene symbols from TSS and gene symbols from TSS contained in
+    gene symbols from TFs. Also gets the symbols which are the same in both lists'''
+
+    tss_gene_symbols_file = infiles[0]
+    tfs_gene_symbols_file = infiles[1]
+
+    tfs_contained_in_TSS_file, TSS_contained_in_tfs_file, common_ids_file = outfiles
+
+    pipelinePIQ.generate_conversion_table_contained(header_table_contained=tss_gene_symbols_file,
+                                                    field_contained="SYMBOL",
+                                                    header_table_containing=tfs_gene_symbols_file,
+                                                    field_containing="gene",
+                                                    output_file=TSS_contained_in_tfs_file)
+
+    pipelinePIQ.generate_conversion_table_contained(header_table_contained=tfs_gene_symbols_file,
+                                                    field_contained="gene",
+                                                    header_table_containing=tss_gene_symbols_file,
+                                                    field_containing="SYMBOL",
+                                                    output_file=tfs_contained_in_TSS_file)
+
+    pipelinePIQ.generate_table_same_ids(header_table1=tfs_gene_symbols_file,
+                            field_table1="gene",
+                            header_table2=tss_gene_symbols_file,
+                            field_table2="SYMBOL",
+                            output_file=common_ids_file)
+
+
+
+
+# @follows(mkdir("TF_TSS_gene_conv.dir"))
+# @transform(generate_alt_symbols,
+#            formatter(),
+#            add_inputs(generate_motif_gene_conv_table),
+#            ["TF_TSS_gene_conv.dir/TF_contained_in_TSS.tsv.gz",
+#             "TF_TSS_gene_conv.dir/TSS_contained_in_TF.tsv.gz",
+#             "TF_TSS_gene_conv.dir/common_ids.gz"])
+# def get_contained_tf_gene_conversions(infiles, outfiles):
+#     ''' Gets gene symbols which are from the TFs contained in gene symbols from TSS and gene symbols from TSS contained in
+#     gene symbols from TFs. Also gets the symbols which are the same in both lists'''
+#
+#     tss_gene_symbols_file = infiles[0]
+#     tfs_gene_symbols_file = infiles[1]
+#
+#     # Get the temp dir
+#     tmp_dir = PARAMS["shared_tmpdir"]
+#
+#     temp_tss_symbols_file = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+#
+#     # Get the tab separated file as one column of symbols, put a header
+#     statement = '''echo "SYMBOL" > %(temp_tss_symbols_file)s && zcat %(tss_gene_symbols_file)s | sed -e 's/\\t/\\n/g' | sort | uniq >> %(temp_tss_symbols_file)s'''
+#
+#
+#     tfs_contained_in_TSS_file, TSS_contained_in_tfs_file, common_ids_file = outfiles
+#
+#     pipelinePIQ.generate_conversion_table_contained(header_table_contained=temp_tss_symbols_file,
+#                                                     field_contained="SYMBOL",
+#                                                     header_table_containing=tfs_gene_symbols_file,
+#                                                     field_containing="gene",
+#                                                     output_file=TSS_contained_in_tfs_file)
+#
+#     pipelinePIQ.generate_conversion_table_contained(header_table_contained=tfs_gene_symbols_file,
+#                                                     field_contained="gene",
+#                                                     header_table_containing=temp_tss_symbols_file,
+#                                                     field_containing="SYMBOL",
+#                                                     output_file=tfs_contained_in_TSS_file)
+#
+#     pipelinePIQ.generate_table_same_ids(header_table1=tfs_gene_symbols_file,
+#                             field_table1="gene",
+#                             header_table2=tss_gene_symbols_file,
+#                             field_table2="SYMBOL",
+#                             output_file=common_ids_file)
+
+
+
+
+@follows(mkdir("interaction_score_per_sample.dir"))
+@collate(calculate_interaction_score,
+         formatter("interaction_score_TF_gene.dir/(?P<SAMPLE>.+)/.+"),
+         add_inputs(generate_motif_gene_conv_table),
+         "interaction_score_per_sample.dir/{SAMPLE[0]}.tsv.gz")
+def generate_interaction_score_per_sample_with_motif_gene(infiles, outfile):
+    ''' Gets the tables containing the genes and interaction scores for each sample and TF and creates a table for each sample
+    with all the data. Substitutes the motif TF with the corresponding gene symbol (uppercase) from the used database.
+    Specifying TF gene (motif), interaction score and gene'''
+
+    # Separate the files
+    interaction_score_table_files = []
+
+    for infile_list in infiles:
+
+        interaction_score_table_files.append(infile_list[0])
+
+    motif_gene_conv_table_file = infiles[0][1]
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    job_memory = "2G"
+
+    # Contains all tables concatenated
+    all_tables_temp = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # First infile
+    first_infile = interaction_score_table_files[0]
+
+    # Add the header with a "tf" column
+    pipelinePIQ.addTFToHeader(first_infile, all_tables_temp)
+
+    # Load the conversion table (motif pos - gene) into memory
+    # gene with "file_position" = 1 will be in the position 0 of this array
+    motif_gene_conv_table = []
+
+    header_red = False
+
+    with IOTools.open_file(motif_gene_conv_table_file, "r") as reader:
+
+        for line in reader:
+
+            # Ignore header
+            if not header_red:
+                header_red = True
+                continue
+
+            # Remove the new line character from the line (avoids taking this into account downstream)
+            line = line.rstrip('\n')
+
+            gene = line.split("\t")[1]
+
+            # Store the gene name with upper case
+            motif_gene_conv_table.append(gene.upper())
+
+    reader.close()
+
+
+    # Empty statement
+    statement = ''''''
+
+
+    # Go through each file
+    for infile in interaction_score_table_files:
+
+        # Extract the TF position in the database
+        match = re.match(".+/(\d+)-(.+)\.tsv.gz", infile)
+
+        # If there is a match store the information
+        if match:
+            pos_motif = int(match.group(1))
+        else:
+            raise Exception("The file "+infile+" can't be matched for the TF")
+
+
+        # Get the corresponding gene
+        # pos_motif 1 is stored in pos 0
+        gene = motif_gene_conv_table[pos_motif-1]
+
+        # If the statement is not the first append "&&"
+        if interaction_score_table_files[0] != infile:
+            statement += ''' && '''
+
+        # Now generate a version of the file which contains the TF on the first column and append to the output table
+        # Skip the header since it was already outputted
+        statement += '''zcat ''' + infile + ''' | tail -n +2 | awk 'BEGIN {FS ="\\t";OFS=FS} {printf("'''+gene+'''\\t%%s\\n", $0)}' >> %(all_tables_temp)s'''
+
+    # Now gzip the file and make it the outfile
+    statement += ''' && cat %(all_tables_temp)s | gzip > %(outfile)s'''
+
+    P.run(statement)
+
+
+
+
+
+@follows(mkdir("interaction_score_per_sample_symbols.dir"))
+@transform(generate_interaction_score_per_sample_with_motif_gene,
+           formatter("interaction_score_per_sample.dir/(?P<SAMPLE>.+).tsv.gz"),
+           "interaction_score_per_sample_symbols.dir/{SAMPLE[0]}.tsv.gz")
+def interaction_score_per_sample_gene_symbols(infile, outfile):
+    ''' Adds the gene symbols to the genes ensembl ids (gene column) in uppercase.'''
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    job_memory = "2G"
+
+    # Temp table with gene names
+    temp_gene_names = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Convert Ensembl ids to gene names (second column), maintains the row order and allows for multiple ensembl gene ids
+    # in multiple rows.
+    # If a gene symbol can't be found, the ensembl id is stored.
+    # Load the corresponding R module with the needed libraries
+    # Creates a table from gene    tf      interaction_score -> gene    tf      interaction_score       SYMBOL  GENENAME
+    # Any columns with empty data will be outputted as "NA"
+    statement = '''module load my_apps/sharc-R/3.3.2 && Rscript /home/mbp15ja/dev/pipelines_py3/pipeline_piq/EnsemblTable2Symbols_Maintain_order_field.R %(infile)s 1 TRUE TRUE %(temp_gene_names)s'''
+
+    P.run(statement)
+
+
+
+    # The "SYMBOL" column becomes the "gene" column and the "GENENAME" column becomes "gene_desc"
+    # The table header becomes gene    tf      interaction_score       gene_desc
+
+    # Temp table with gene names
+    temp_gene_names_sorted_cols = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Create the header
+    header = "gene\ttf\tinteraction_score\tgene_desc\n"
+
+    # Write the header
+    with IOTools.open_file(temp_gene_names_sorted_cols, "w") as writer:
+
+        writer.write(header)
+
+    writer.close()
+
+    # Output the data rearranging the columns. Convert gene names to upper case
+    statement = '''paste <(cat %(temp_gene_names)s | tail -n +2 | cut -f4 | tr [a-z] [A-Z]) <(cat %(temp_gene_names)s | tail -n +2 | cut -f2,3,5) >> %(temp_gene_names_sorted_cols)s && 
+    cat %(temp_gene_names_sorted_cols)s | gzip > %(outfile)s && rm %(temp_gene_names)s %(temp_gene_names_sorted_cols)s'''
+
+    job_memory = "2G"
+
+    P.run(statement)
+
+
+@follows(mkdir("tf_to_gene_symbol_annotations.dir"))
+@transform(get_contained_tf_gene_conversions,
+           formatter(),
+           add_inputs(generate_alt_symbols, generate_motif_gene_conv_table),
+           "tf_to_gene_symbol_annotations.dir/tf_gene.tsv.gz")
+def combine_annotations_tf_to_gene_symbol(infiles, outfile):
+    '''Combines all annotations to create a table with the first column the TF id as it appears in the motif database
+     and the subsequent tab separated columns gene symbols to look for from contained/containing manually annotated and alternative gene
+     symbols'''
+
+    tfs_contained_in_TSS, TSS_contained_in_tfs, common_ids = infiles[0]
+
+    tss_alt_symbols = infiles[1]
+
+    motif_gene_conv = infiles[2]
+
+    pipelinePIQ.combine_tf_to_gene_symbol_table(tfs_contained_in_TSS,
+                                                TSS_contained_in_tfs,
+                                                tss_alt_symbols,
+                                                motif_gene_conv,
+                                                tf_conversions_table=outfile)
+
+
+
+
+@follows(mkdir("network_tables.dir"))
+@subdivide(interaction_score_per_sample_gene_symbols,
+           formatter("interaction_score_per_sample_symbols.dir/(?P<SAMPLE>.+).tsv.gz"),
+           add_inputs(combine_annotations_tf_to_gene_symbol),
+           "network_tables.dir/{SAMPLE[0]}/*.tsv.gz",
+           "network_tables.dir/{SAMPLE[0]}")  # Output directory
+def generate_tables_network_plots(infiles, outfiles, output_dir_path):
+    '''Gets for each sample, the top number of specified interaction scores between TF and genes.
+    For each TF in that list, gets the interactions scores in all the sample interaction scores where the gene
+    is the TF. Outputs each sample - TF to a table.
+    At this point any empty values in the table should be reported as "NA"'''
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(output_dir_path):
+        os.makedirs(output_dir_path)
+
+    # The files from the previous run need to be deleted (previous run files may have been
+    # generated which will not be generated now and they will remain)
+    for file_in_path in listdir(output_dir_path):
+
+        file_full_path = os.path.join(output_dir_path, file_in_path)
+
+        if os.path.isfile(file_full_path):
+            os.unlink(file_full_path)
+
+    interaction_scores_file = infiles[0]
+
+    tf_gene_symbols_conv_file = infiles[1]
+
+    # Get the maximum number of edges to plot (top interaction score)
+    max_edges = PARAMS["network_plots_max_edges"]
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # First we get for each TF:
+    # -The top edges (from the global max_edges specified for all TF) by interaction score specified.
+    # -We then see in the full list of edges, which have the TF as target gene
+    # Return a dictionary for each TF with the name of the TF and the file containing all the relevant edges
+    pipelinePIQ.get_relevant_TFs_for_top_TF_gene_edges(interaction_scores_file=interaction_scores_file,
+                                                                                     tf_gene_symbols_conv_file=tf_gene_symbols_conv_file,
+                                                                                     outdir=output_dir_path,
+                                                                                     max_num_edges=max_edges,
+                                                                                     tmp_dir=tmp_dir)
+
+
+
+@follows(mkdir("network_tables_processed.dir"))
+@transform(generate_tables_network_plots,
+           formatter("network_tables.dir/(?P<SAMPLE>.+)/(?P<TF>.+).tsv.gz"),
+           "network_tables_processed.dir/{SAMPLE[0]}/{TF[0]}.tsv.gz")  # Output directory
+def process_table_strings(infile, outfile):
+    '''Removes strings from the tables to make the gene symbols shorter'''
+
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+    # Get the string to replace
+    replacing_string = PARAMS["replacing_strings_tables"]
+
+    job_memory = "2G"
+
+    # If the replacement string is empty just copy
+    if replacing_string != "":
+
+        statement = '''zcat %(infile)s | sed -e 's/%(replacing_string)s//g' | gzip > %(outfile)s'''
+
+    else:
+
+        statement = '''cp %(infile)s %(outfile)s'''
+
+
+    P.run(statement)
+
+
+
+
+
+
+@follows(mkdir("network_plots.dir"))
+@transform(process_table_strings,
+           formatter("network_tables_processed.dir/(?P<SAMPLE>.+)/(?P<TF>.+).tsv.gz"),
+           "network_plots.dir/{SAMPLE[0]}/{TF[0]}.png",
+           "{TF[0]}")
+def generate_network_plots(infile, outfile, tf):
+    '''Starting with a table of a sample and TF with all the interactions where it is involved, plots a network.'''
+
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+    max_edges_to_show = PARAMS["max_edges_show_per_tf"]
+
+    pipelinePIQ.generateNetworkPlots(infile,
+                                     tf,
+                                     outfile,
+                                     max_edges_to_show,
+                                     submit=True,
+                                     job_memory="2G")
+
+
+
+
+###################################### On demand network plots #################################
+
+
+
+###################################### Statistics #############################################
+
+@follows(mkdir("sign_calls_stats.dir"))
+@collate(filter_matches_in_peaks,
+         formatter("calls_filtered_peaks.dir/(?P<SAMPLE>.+)/.*-calls.in_peaks.bed.gz"),
+         add_inputs(generate_motif_gene_conv_table),
+         "sign_calls_stats.dir/{SAMPLE[0]}/binding_sites_per_TF.tsv.gz",
+         "{SAMPLE[0]}")
+def get_sign_calls_in_peaks_stats_per_sample(infiles, outfile, sample):
+    ''' Gets all the binding sites within sample peaks per sample and TF '''
+
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+
+    # Separate the files
+    calls_files = []
+
+    for infile_list in infiles:
+        calls_files.append(infile_list[0])
+
+    motif_gene_conv_table_file = infiles[0][1]
+
+    # Load the conversion table (motif pos - gene) into memory
+    # gene with "file_position" = 1 will be in the position 0 of this array
+    motif_gene_conv_table = []
+
+    header_red = False
+
+    with IOTools.open_file(motif_gene_conv_table_file, "r") as reader:
+
+        for line in reader:
+
+            # Ignore header
+            if not header_red:
+                header_red = True
+                continue
+
+            # Remove the new line character from the line (avoids taking this into account downstream)
+            line = line.rstrip('\n')
+
+            gene = line.split("\t")[1]
+
+            # Store the gene name with upper case
+            motif_gene_conv_table.append(gene.upper())
+
+    reader.close()
+
+
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Outfile containing each TF id (as in the database) and the count of binding sites in peaks
+    temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Create a statement which adds a header with the subgroup
+    statement = '''header=$(printf "TF\\t%(sample)s") && 
+        echo "$header" > %(temp_outfile)s '''
+
+
+    # Go through all the possible motifs (id from the database), go from 1 to the length of the database
+    for i in range(1,(countMotifs(os.path.join(PARAMS["PIQ_PATH"], PARAMS["motif_db"])))+1):
+
+        # Get the corresponding TF name from the conversion table
+        # Get the corresponding gene
+        # pos_motif 1 is stored in pos 0
+        gene_name = motif_gene_conv_table[i - 1]
+
+        # Determine if an infile is found for this TF
+        matched_infile = False
+
+
+        # Go through the infiles and match the transcription factor id
+        for infile in calls_files:
+
+            # Extract the TF position in the database
+            match = re.match(".+/"+str(i)+"-(.+)-calls.in_peaks.bed.gz", infile)
+
+            # If there is a match count the number of lines and store the data in the next row
+            if match:
+
+                matched_infile = True
+
+                # If the file has size 0
+                if os.stat(infile).st_size == 0:
+                    statement += ''' && printf "''' + gene_name + '''\\t0\\n" >> %(temp_outfile)s '''
+
+                else:
+                    statement += ''' && count_lines=$(zcat '''+infile+''' | wc -l) && 
+                        printf "'''+gene_name+'''\\t$count_lines\\n" >> %(temp_outfile)s '''
+
+
+                # A match has been found, there is no need to keep looking in the infiles
+                break
+
+
+        # If an infile wasn't matched output 0 matches
+        if not matched_infile:
+
+            statement += ''' && printf "'''+gene_name+'''\\t0\\n" >> %(temp_outfile)s '''
+
+
+
+    # Now we delete any long names
+
+    # Create a temporal filename which is compressed
+    temp_outfile_short = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name + ".gz"
+
+    # Compress the temp file into the outfile and delete the temp file
+    statement += ''' && cat %(temp_outfile)s | gzip > %(temp_outfile_short)s'''
+
+    job_memory = "2G"
+
+    P.run(statement)
+
+    process_table_strings(temp_outfile_short, outfile)
+
+    # Delete the temporal files
+    os.unlink(temp_outfile)
+
+    os.unlink(temp_outfile_short)
+
+
+
+
+
+
+
+@merge(get_sign_calls_in_peaks_stats_per_sample,
+       "sign_calls_stats.dir/binding_sites_per_TF.tsv.gz")
+def group_sign_calls_in_peaks_stats_per_sample_per_experiment(infiles, outfile):
+    ''' Merges all the binding sites within sample peaks per sample and TF into one file. '''
+
+    # NOTE: It is assuming that all table contain the same number of rows and in the same order
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Outfile to make sure the process is completed before output
+    outfile_temp = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+
+    # Get a string space separated list of all the infiles
+    all_infiles_string = " ".join(infiles)
+
+    log_file = P.snip(outfile, ".tsv.gz") + ".log"
+
+    error_file = P.snip(outfile, ".tsv.gz") + ".error"
+
+    statement = '''cgat
+    combine_tables %(all_infiles_string)s -c 1 -k 2 -L %(log_file)s -E %(error_file)s
+                 > %(outfile_temp)s && '''
+
+    statement += ''' cat %(outfile_temp)s | gzip > %(outfile)s '''
+
+    P.run(statement)
+
+    # Delete the temporal file
+    os.unlink(outfile_temp)
+
+
+
+
+
+@transform(get_sign_calls_in_peaks_stats_per_sample,
+         formatter("sign_calls_stats.dir/(?P<SAMPLE>.+)/binding_sites_per_TF.tsv.gz"),
+         "sign_calls_stats.dir/{SAMPLE[0]}/top_TFs_by_binding_sites_per_TF.png",
+         "{SAMPLE[0]}")
+def generate_barchart_top_tf_sign_tf_calls_in_peaks_per_sample(infile, outfile, sample):
+    ''' Generates a barchart of the top TFs in terms of number of significant binding sites calls per sample'''
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    x_lab = "TF"
+    y_lab = "Number of significant bound sites"
+    title = "Number of significant bound sites for the top 50 TFs, "+sample
+
+    pipelinePIQ.generate_top_rows_histogram(dataframe_file = infile,
+                                            sample = sample,
+                                            num_top_hits = 50,
+                                            outfile = outfile,
+                                            x_lab = x_lab,
+                                            y_lab = y_lab,
+                                            title = title,
+                                            tmp_dir = tmp_dir)
+
+
+
+
+
+
+
+
+
+
+# Nearly a copy of get_sign_calls_in_peaks_stats_per_sample
+@follows(mkdir("num_genes_near_sign_tf_bind_sites.dir"))
+@collate(merge_filtered_motifs_in_all_regions,
+         formatter("motifs_assigned_to_all_regions.dir/(?P<SAMPLE>.+)/.*-TSS.tsv.gz"),
+         add_inputs(generate_motif_gene_conv_table),
+         "num_genes_near_sign_tf_bind_sites.dir/{SAMPLE[0]}/binding_sites_per_TF.tsv.gz",
+         "{SAMPLE[0]}")
+def get_num_genes_near_sign_tf_binding_sites_per_sample(infiles, outfile, sample):
+    ''' Gets all the unique genes near the significant binding sites per sample and TF '''
+
+    # If the directory for the sample doesn't exist, create it
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+    # Separate the files
+    calls_files = []
+
+    for infile_list in infiles:
+        calls_files.append(infile_list[0])
+
+    motif_gene_conv_table_file = infiles[0][1]
+
+    # Load the conversion table (motif pos - gene) into memory
+    # gene with "file_position" = 1 will be in the position 0 of this array
+    motif_gene_conv_table = []
+
+    header_red = False
+
+    with IOTools.open_file(motif_gene_conv_table_file, "r") as reader:
+
+        for line in reader:
+
+            # Ignore header
+            if not header_red:
+                header_red = True
+                continue
+
+            # Remove the new line character from the line (avoids taking this into account downstream)
+            line = line.rstrip('\n')
+
+            gene = line.split("\t")[1]
+
+            # Store the gene name with upper case
+            motif_gene_conv_table.append(gene.upper())
+
+    reader.close()
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    # Outfile containing each TF id (as in the database) and the count of binding sites in peaks
+    temp_outfile = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name
+
+    # Create a statement which adds a header with the subgroup
+    statement = '''header=$(printf "TF\\t%(sample)s") && 
+        echo "$header" > %(temp_outfile)s '''
+
+    # Go through all the possible motifs (id from the database), go from 1 to the length of the database
+    for i in range(1, (countMotifs(os.path.join(PARAMS["PIQ_PATH"], PARAMS["motif_db"]))) + 1):
+
+        # Get the corresponding TF name from the conversion table
+        # Get the corresponding gene
+        # pos_motif 1 is stored in pos 0
+        gene_name = motif_gene_conv_table[i - 1]
+
+        # Determine if an infile is found for this TF
+        matched_infile = False
+
+        # Go through the infiles and match the transcription factor id
+        for infile in calls_files:
+
+            # Extract the TF position in the database
+            match = re.match(".+/" + str(i) + "-(.+)-TSS.tsv.gz", infile)
+
+            # If there is a match count the number of lines and store the data in the next row
+            if match:
+
+                matched_infile = True
+
+                # If the file has size 0
+                if os.stat(infile).st_size == 0:
+                    statement += ''' && printf "''' + gene_name + '''\\t0\\n" >> %(temp_outfile)s '''
+
+                else:
+
+                    statement += ''' && count_uniq_genes=$(zcat ''' + infile + ''' | cut -f 7 | sort | uniq | wc -l) && 
+                        printf "''' + gene_name + '''\\t$count_uniq_genes\\n" >> %(temp_outfile)s '''
+
+                # A match has been found, there is no need to keep looking in the infiles
+                break
+
+        # If an infile wasn't matched output 0 matches
+        if not matched_infile:
+            statement += ''' && printf "''' + gene_name + '''\\t0\\n" >> %(temp_outfile)s '''
+
+    # Now we delete any long names
+
+    # Create a temporal filename which is compressed
+    temp_outfile_short = (tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)).name + ".gz"
+
+    # Compress the temp file into the outfile and delete the temp file
+    statement += ''' && cat %(temp_outfile)s | gzip > %(temp_outfile_short)s'''
+
+    job_memory = "2G"
+
+    P.run(statement)
+
+    process_table_strings(temp_outfile_short, outfile)
+
+    # Delete the temporal files
+    os.unlink(temp_outfile)
+
+    os.unlink(temp_outfile_short)
+
+
+
+
+
+@merge(get_num_genes_near_sign_tf_binding_sites_per_sample,
+       "num_genes_near_sign_tf_bind_sites.dir/unique_genes_near_binding_sites_per_TF.tsv.gz")
+def group_num_genes_near_sign_tf_binding_sites_per_sample_per_experiment(infiles, outfile):
+    ''' Merges all the unique genes near the significant binding sites per sample and TF into one file. '''
+
+
+    # NOTE: It is assuming that all table contain the same number of rows and in the same order
+
+    group_sign_calls_in_peaks_stats_per_sample_per_experiment(infiles, outfile)
+
+
+
+
+
+@transform(get_num_genes_near_sign_tf_binding_sites_per_sample,
+         formatter("num_genes_near_sign_tf_bind_sites.dir/(?P<SAMPLE>.+)/binding_sites_per_TF.tsv.gz"),
+         "num_genes_near_sign_tf_bind_sites.dir/{SAMPLE[0]}/top_TFs_by_uniq_genes_binding_sites_per_TF.png",
+         "{SAMPLE[0]}")
+def generate_barchart_top_tf_num_genes_sign_binding_sites_calls_per_sample(infile, outfile, sample):
+    ''' Generates a barchart of the sample top TFs in terms of unique genes near the significant binding sites'''
+
+    # Get the temp dir
+    tmp_dir = PARAMS["shared_tmpdir"]
+
+    x_lab = "TF"
+    y_lab = "Number of genes near significant bound sites"
+    title = "Number of genes near significant bound sites for the top 50 TFs, "+sample
+
+    pipelinePIQ.generate_top_rows_histogram(dataframe_file = infile,
+                                            sample = sample,
+                                            num_top_hits = 50,
+                                            outfile = outfile,
+                                            x_lab = x_lab,
+                                            y_lab = y_lab,
+                                            title = title,
+                                            tmp_dir = tmp_dir)
+
+
+
+
+
+@follows(group_sign_calls_in_peaks_stats_per_sample_per_experiment,
+         group_num_genes_near_sign_tf_binding_sites_per_sample_per_experiment,
+         generate_barchart_top_tf_sign_tf_calls_in_peaks_per_sample,
+         generate_barchart_top_tf_num_genes_sign_binding_sites_calls_per_sample)
+def generateStats():
+    ''' Dummy task to sync the generation of stats '''
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+@follows(generate_network_plots,
+         combine_annotations_tf_to_gene_symbol,
+         generateStats)
+         #generate_histogram_interaction_scores)
 def full():
     pass
 
